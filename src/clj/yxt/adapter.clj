@@ -13,7 +13,8 @@
            [org.eclipse.jetty.websocket.server WebSocketHandler]
            [org.eclipse.jetty.websocket.servlet
             WebSocketServletFactory WebSocketCreator
-            ServletUpgradeRequest ServletUpgradeResponse]
+            ServletUpgradeRequest ServletUpgradeResponse
+            WebSocketServlet]
            [javax.servlet.http HttpServletRequest HttpServletResponse]
            [org.eclipse.jetty.websocket.api
             WebSocketAdapter Session
@@ -21,9 +22,12 @@
            [org.eclipse.jetty.http2.server
             HTTP2CServerConnectionFactory HTTP2ServerConnectionFactory]
            [java.nio ByteBuffer]
-           [clojure.lang IFn])
+           [clojure.lang IFn]
+           [java.net URLDecoder])
   (:require [ring.util.servlet :as servlet]
-            [clojure.string :as string]))
+            [clojure.string :as string]
+
+            [yxt.redis :as r]))
 
 (defprotocol WebSocketProtocol
   (send! [this msg])
@@ -59,13 +63,7 @@
   Object
   (-send! [this ws]
     (-> ^WebSocketAdapter ws .getRemote
-        (.sendString ^RemoteEndpoint (str this))))
-
-  ;; "nil" could PING?
-  ;; nil
-  ;; (-send! [this ws] ()
-
-  )
+        (.sendString ^RemoteEndpoint (str this)))))
 
 (defprotocol RequestMapDecoder
   (build-request-map [r]))
@@ -110,34 +108,55 @@
 (defn- do-nothing [& args])
 
 (defn- proxy-ws-adapter
-  [{:as ws-fns
-    :keys [on-connect on-error on-text on-close on-bytes]
-    :or {on-connect do-nothing
-         on-error do-nothing
-         on-text do-nothing
-         on-close do-nothing
-         on-bytes do-nothing}}]
+  [data {:as ws-fns
+         :keys [on-connect on-error on-text on-close on-bytes]
+         :or {on-connect do-nothing
+              on-error do-nothing
+              on-text do-nothing
+              on-close do-nothing
+              on-bytes do-nothing}}]
   (proxy [WebSocketAdapter] []
     (onWebSocketConnect [^Session session]
       (let [^WebSocketAdapter this this]
         (proxy-super onWebSocketConnect session))
-      (on-connect this))
+      (on-connect data this))
     (onWebSocketError [^Throwable e]
-      (on-error this e))
+      (on-error data this e))
     (onWebSocketText [^String message]
-      (on-text this message))
+      (on-text data this message))
     (onWebSocketClose [statusCode ^String reason]
       (let [^WebSocketAdapter this this]
         (proxy-super onWebSocketClose statusCode reason))
-      (on-close this statusCode reason))
+      (on-close data this statusCode reason))
     (onWebSocketBinary [^bytes payload offset len]
-      (on-bytes this payload offset len))))
+      (on-bytes data this payload offset len))))
+
+(defn resolve-cookie
+  [cookies]
+  (reduce (fn [m ^String s]
+            (let [[k v] (string/split s #"=")]
+              (assoc m (keyword k) v)))
+          {} cookies))
 
 (defn- reify-ws-creator
   [ws-fns]
   (reify WebSocketCreator
-    (createWebSocket [this _ _]
-      (proxy-ws-adapter ws-fns))))
+    (createWebSocket [this req resp]
+      (let [p (first (.getSubProtocols req))
+            c (:yxt-session
+               (resolve-cookie
+                (.getHeaders req "Cookie")))
+            cookie (when c
+                     (URLDecoder/decode
+                      c))
+            user (-> (r/get-cache cookie)
+                     :yxt :user)]
+        (if (not-empty user)
+          (do
+            (.setAcceptedSubProtocol resp p)
+            (proxy-ws-adapter {:key cookie
+                               :user user}  ws-fns))
+          (.sendForbidden resp "You are not login"))))))
 
 (defn- proxy-ws-handler
   "Returns a Jetty websocket handler"
@@ -148,7 +167,15 @@
     (configure [^WebSocketServletFactory factory]
       (-> (.getPolicy factory)
           (.setIdleTimeout ws-max-idle-time))
-      (.setCreator factory (reify-ws-creator ws-fns)))))
+      (.setCreator factory (reify-ws-creator ws-fns)))
+    (handle [^String target, ^Request request req res]
+      (let [wsf (proxy-super getWebSocketFactory)]
+        (if (.isUpgradeRequest wsf req res)
+          (if (.acceptWebSocket wsf req res)
+            (.setHandled request true)
+            (when (.isCommitted res)
+              (.setHandled request true)))
+          (proxy-super handle target request req res))))))
 
 (defn- proxy-handler
   "Returns an Jetty Handler implementation for the given Ring handler."
@@ -243,7 +270,7 @@
                          (.setHost host)
                          (.setIdleTimeout max-idle-time))
 
-        secure-connection-factory [(HttpConnectionFactory. http-configuration)]
+        secure-connection-factory (list (HttpConnectionFactory. http-configuration))
         secure-connection-factory (if h2?
                                     (conj secure-connection-factory
                                           (HTTP2ServerConnectionFactory. http-configuration))
@@ -277,6 +304,7 @@
   :keystore - the keystore to use for SSL connections
   :keystore-type - the format of keystore
   :key-password - the password to the keystore
+  :key-manager-password - the password for key manager
   :truststore - a truststore to use for SSL connections
   :truststore-type - the format of trust store
   :trust-password - the password to the truststore
@@ -289,7 +317,7 @@
   :client-auth - SSL client certificate authenticate, may be set to :need, :want or :none (defaults to :none)
   :websockets - a map from context path to a map of handler fns:
 
-  {\"/context\" {:on-connect #(create-fn %)                ; ^Session ws-session
+  {\"/context\" {:on-connect #(create-fn %)              ; ^Session ws-session
                 :on-text   #(text-fn % %2 %3 %4)         ; ^Session ws-session message
                 :on-bytes  #(binary-fn % %2 %3 %4 %5 %6) ; ^Session ws-session payload offset len
                 :on-close  #(close-fn % %2 %3 %4)        ; ^Session ws-session statusCode reason
